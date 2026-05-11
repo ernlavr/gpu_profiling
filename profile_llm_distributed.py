@@ -68,6 +68,12 @@ def _barrier() -> None:
         dist.barrier()
 
 
+def _log_prog(msg: str) -> None:
+    """Progress line on rank 0 (or the only process if not distributed)."""
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print(f"[prog] {msg}", flush=True)
+
+
 def _all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
     if not dist.is_initialized():
         return t
@@ -144,6 +150,7 @@ def _prepare_wikitext2(
     ``max_* × raw_text_oversample`` raw lines of that split are tokenized (approximate
     text budget), then blocks are capped to the max sequence count.
     """
+    _log_prog("wikitext: loading raw dataset (HF hub; first time may download)...")
     raw = load_dataset("wikitext", "wikitext-2-raw-v1")
     train_raw = raw["train"]
     val_raw = raw["validation"]
@@ -167,12 +174,14 @@ def _prepare_wikitext2(
         o = tokenizer(batch["text"], add_special_tokens=False, padding=False, truncation=False)
         return {"input_ids": o["input_ids"], "attention_mask": o["attention_mask"]}
 
+    _log_prog("wikitext: tokenizing train split...")
     tokenized_train = train_raw.map(
         tok,
         batched=True,
         remove_columns=train_raw.column_names,
         desc="tokenize wikitext-2 train",
     )
+    _log_prog("wikitext: tokenizing validation split...")
     tokenized_val = val_raw.map(
         tok,
         batched=True,
@@ -192,11 +201,13 @@ def _prepare_wikitext2(
         out_attn = [attn[i : i + block_size] for i in range(0, total, block_size)]
         return {"input_ids": out_ids, "attention_mask": out_attn}
 
+    _log_prog("wikitext: grouping train into fixed-length blocks...")
     lm_train = tokenized_train.map(
         group_texts,
         batched=True,
         desc="group train",
     )
+    _log_prog("wikitext: grouping validation into blocks...")
     lm_val = tokenized_val.map(
         group_texts,
         batched=True,
@@ -414,6 +425,7 @@ def profile_train(
     amp_dtype: torch.dtype | None,
     grad_clip: float | None,
 ) -> dict[str, float]:
+    _log_prog(f"train profile: warmup ({warmup} optimizer steps)...")
     model.train()
     total_tokens = 0
     seq_len = 0
@@ -432,6 +444,7 @@ def profile_train(
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
+    _log_prog(f"train profile: timed benchmark ({steps} steps, measuring tokens/s + peak VRAM)...")
     _reset_peak_memory_stats()
     t0 = time.perf_counter()
     for _ in range(steps):
@@ -453,6 +466,7 @@ def profile_train(
     _barrier()
     elapsed_local = time.perf_counter() - t0
     peak_local = _peak_memory_mib(device)
+    _log_prog("train profile: timed section finished")
 
     tok = torch.tensor([float(total_tokens)], device=device)
     tok = _all_reduce_sum(tok)
@@ -481,6 +495,7 @@ def profile_infer(
     warmup: int,
     amp_dtype: torch.dtype | None,
 ) -> dict[str, float]:
+    _log_prog(f"infer profile: warmup ({warmup} forward passes)...")
     model.eval()
     seq_len = 0
 
@@ -495,6 +510,7 @@ def profile_infer(
         torch.cuda.synchronize()
 
     total_tokens = 0
+    _log_prog(f"infer profile: timed benchmark ({steps} steps)...")
     _reset_peak_memory_stats()
     t0 = time.perf_counter()
     for _ in range(steps):
@@ -510,6 +526,7 @@ def profile_infer(
     _barrier()
     elapsed_local = time.perf_counter() - t0
     peak_local = _peak_memory_mib(device)
+    _log_prog("infer profile: timed section finished")
 
     tok = torch.tensor([float(total_tokens)], device=device)
     tok = _all_reduce_sum(tok)
@@ -661,6 +678,11 @@ def main() -> None:
     args = parse_args()
     distributed, rank, world_size, local_rank = _dist_info()
 
+    _log_prog(
+        f"startup rank={rank}/{world_size} local_rank={local_rank} "
+        f"distributed={distributed} cuda={torch.cuda.is_available()}"
+    )
+
     torch.manual_seed(args.seed + rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed + rank)
@@ -668,7 +690,9 @@ def main() -> None:
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     if distributed:
+        _log_prog(f"initializing process group (backend={args.backend!r})...")
         _init_dist(args.backend, local_rank)
+        _log_prog("process group ready")
 
     amp_dtype: torch.dtype | None = None
     load_dtype: torch.dtype | None = None
@@ -678,9 +702,11 @@ def main() -> None:
     elif args.fp16 and torch.cuda.is_available():
         amp_dtype = torch.float16
 
+    _log_prog(f"loading tokenizer: {args.model!r}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    _log_prog("tokenizer ready")
 
     lm_train, lm_val = _prepare_wikitext2(
         tokenizer,
@@ -719,6 +745,10 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
         collate_fn=_collate_lm_batch,
     )
+    _log_prog(
+        f"DataLoaders ready (train_batches≈{len(train_loader)} val_batches≈{len(val_loader)} "
+        f"per epoch, per_device_batch={args.per_device_batch})"
+    )
 
     if rank == 0:
         print(
@@ -731,11 +761,15 @@ def main() -> None:
             flush=True,
         )
 
+    _log_prog("loading causal LM weights from Hugging Face (may download)...")
     model = _load_causal_lm(args.model, args.trust_remote_code, load_dtype)
+    _log_prog("model weights loaded")
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
+        _log_prog("gradient checkpointing enabled")
 
+    _log_prog(f"applying distributed wrap: {args.strategy!r}")
     if args.strategy == "ddp":
         model = model.to(device)
         if distributed and world_size > 1:
@@ -776,13 +810,16 @@ def main() -> None:
         )
     else:
         raise ValueError(args.strategy)
+    _log_prog("distributed wrap complete")
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    _log_prog("optimizer (AdamW) ready")
 
     # Optional: auto max batch (train and/or infer caps), then rebuild loaders with chosen batch.
     train_bs = args.per_device_batch
     infer_bs = args.per_device_batch
     if args.auto_max_batch:
+        _log_prog("auto-max-batch: searching largest micro-batch (this can take a while)...")
         search_train_sampler = DistributedSampler(
             lm_train,
             shuffle=True,
@@ -798,10 +835,13 @@ def main() -> None:
             collate_fn=_collate_lm_batch,
         )
         search_train_sampler.set_epoch(args.seed)
+        _log_prog(f"auto-max-batch: building CPU token window (cap={args.batch_search_cap})...")
         cpu_ids, cpu_mask = _build_cpu_token_window(search_loader, args.batch_search_cap, args.seq_len)
+        _log_prog("auto-max-batch: CPU window ready")
 
         if args.mode in ("train", "both"):
             _barrier()
+            _log_prog("auto-max-batch: binary search on train (forward+backward+step)...")
             train_bs_local = find_max_batch_train(
                 model,
                 optim,
@@ -816,8 +856,10 @@ def main() -> None:
             train_bs = int(_all_reduce_min(bs_tensor)[0].item())
             if rank == 0:
                 print(f"[auto-max-batch] train per_device_batch={train_bs}", flush=True)
+            _log_prog(f"auto-max-batch: train micro-batch chosen (global min over ranks)={train_bs}")
 
         if args.mode in ("infer", "both"):
+            _log_prog("auto-max-batch: building val CPU token window...")
             search_val_sampler = DistributedSampler(lm_val, shuffle=False, drop_last=False)
             val_search = DataLoader(
                 lm_val,
@@ -829,6 +871,7 @@ def main() -> None:
             )
             cpu_ids_v, cpu_mask_v = _build_cpu_token_window(val_search, args.batch_search_cap, args.seq_len)
             _barrier()
+            _log_prog("auto-max-batch: binary search on inference...")
             infer_bs_local = find_max_batch_infer(
                 model,
                 device,
@@ -841,6 +884,7 @@ def main() -> None:
             infer_bs = int(_all_reduce_min(bs_tensor)[0].item())
             if rank == 0:
                 print(f"[auto-max-batch] infer per_device_batch={infer_bs}", flush=True)
+            _log_prog(f"auto-max-batch: infer micro-batch chosen (global min over ranks)={infer_bs}")
 
         train_loader = DataLoader(
             lm_train,
@@ -863,12 +907,14 @@ def main() -> None:
                 f"[config] effective per_device_batch train={train_bs} infer={infer_bs}",
                 flush=True,
             )
+        _log_prog("auto-max-batch: rebuilding DataLoaders with chosen batch sizes")
 
     train_iter = _iter_forever(train_loader)
     val_iter = _iter_forever(val_loader)
 
     wandb_run = None
     if rank == 0 and args.wandb_project:
+        _log_prog(f"Weights & Biases: initializing run (project={args.wandb_project!r})...")
         try:
             import wandb
         except ImportError as e:
@@ -889,9 +935,11 @@ def main() -> None:
                 val_dataset_len=len(lm_val),
             ),
         )
+        _log_prog("Weights & Biases: run active")
 
     results: dict[str, float] = {}
     try:
+        _log_prog(f"--- profiling ({args.mode}) ---")
         if args.mode in ("train", "both"):
             train_sampler.set_epoch(args.seed)
             results.update(
@@ -906,6 +954,7 @@ def main() -> None:
                     grad_clip=args.grad_clip,
                 )
             )
+            _log_prog("training profile section complete")
         if args.mode in ("infer", "both"):
             val_sampler.set_epoch(0)
             results.update(
@@ -918,6 +967,7 @@ def main() -> None:
                     amp_dtype=amp_dtype,
                 )
             )
+            _log_prog("inference profile section complete")
 
         _barrier()
         if rank == 0:
@@ -965,10 +1015,13 @@ def main() -> None:
         if rank == 0 and wandb_run is not None:
             import wandb
 
+            _log_prog("Weights & Biases: finishing run...")
             wandb.finish()
 
     if dist.is_initialized():
+        _log_prog("destroying distributed process group...")
         dist.destroy_process_group()
+    _log_prog("exit ok")
 
 
 if __name__ == "__main__":
