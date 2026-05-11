@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run FSDP then DDP; full logs under profile_runs/<timestamp>/console.log
+# Run FSDP then DDP. Writes profile_runs/<stamp>/console.log and metrics.jsonl (one JSON line per strategy).
 #
 #   export NPROC=4
 #   export MODEL=gpt2
@@ -19,7 +19,9 @@ STAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
 OUT="${ROOT}/profile_runs/${STAMP}"
 mkdir -p "$OUT"
 LOG="${OUT}/console.log"
+METRICS="${OUT}/metrics.jsonl"
 : >"$LOG"
+: >"$METRICS"
 
 echo "[run_profile_comparison] OUT_DIR=$OUT NPROC=$NPROC MODEL=$MODEL" | tee -a "$LOG"
 echo "[run_profile_comparison] EXTRA_ARGS=${EXTRA_ARGS:-}" | tee -a "$LOG"
@@ -34,6 +36,7 @@ run_one() {
     --model "${MODEL}" \
     --bf16 \
     --mode both \
+    --metrics-out "${METRICS}" \
     ${EXTRA_ARGS:-} \
     2>&1 | tee -a "$LOG"
 }
@@ -41,4 +44,4 @@ run_one() {
 run_one fsdp
 run_one ddp
 echo "" | tee -a "$LOG"
-echo "[run_profile_comparison] done: $LOG" | tee -a "$LOG"
+echo "[run_profile_comparison] done: log=$LOG metrics=$METRICS" | tee -a "$LOG"

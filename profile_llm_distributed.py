@@ -2,7 +2,12 @@
 """Minimal multi-GPU causal LM on Wikitext-2: timed training + inference (DDP or FSDP).
 
   torchrun --nproc_per_node=4 profile_llm_distributed.py --strategy fsdp --bf16
-  torchrun --nproc_per_node=4 profile_llm_distributed.py --strategy ddp --bf16 --per-device-batch 2
+  torchrun --nproc_per_node=4 profile_llm_distributed.py --strategy ddp --bf16 \\
+      --metrics-out run.jsonl
+
+  Metrics file: one JSON object per line (rank 0). Plot: ``pandas.read_json(path, lines=True)``.
+
+  W&B (rank 0): ``--wandb-project myproj`` (optional ``--wandb-entity``, ``--wandb-run-name``); ``wandb login`` or ``WANDB_API_KEY``.
 """
 
 from __future__ import annotations
@@ -10,8 +15,10 @@ from __future__ import annotations
 import argparse
 import functools
 import itertools
+import json
 import os
 import time
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from typing import Any, Iterator
 
@@ -248,6 +255,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fsdp-min-num-params", type=int, default=10_000_000)
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--metrics-out",
+        type=str,
+        default="profile_metrics.jsonl",
+        help="Append one JSON line per run (rank 0). Empty string disables. "
+        "Use with pandas.read_json(path, lines=True) for plots.",
+    )
+    p.add_argument("--wandb-project", type=str, default="", help="Weights & Biases project (empty = disabled).")
+    p.add_argument("--wandb-entity", type=str, default="", help="W&B entity/team (optional).")
+    p.add_argument("--wandb-run-name", type=str, default="", help="W&B run name (optional).")
     return p.parse_args()
 
 
@@ -310,8 +327,7 @@ def main() -> None:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
-    wrap = args.strategy
-    if wrap == "ddp":
+    if args.strategy == "ddp":
         model = model.to(device)
         if distributed and world_size > 1:
             model = nn.parallel.DistributedDataParallel(
@@ -349,38 +365,107 @@ def main() -> None:
     val_it = _cycle(val_loader)
     out: dict[str, float] = {}
 
-    if args.mode in ("train", "both"):
-        train_sampler.set_epoch(args.seed)
-        out.update(
-            run_train(
-                model,
-                optim,
-                device,
-                train_it,
-                steps=args.steps,
-                warmup=args.warmup,
-                amp_dtype=amp_dtype,
-                grad_clip=args.grad_clip,
+    wandb_run = None
+    try:
+        if _rank0() and args.wandb_project:
+            try:
+                import wandb
+            except ImportError as e:
+                raise ImportError("Install wandb: pip install wandb") from e
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity or None,
+                name=args.wandb_run_name or None,
+                config={
+                    "model": args.model,
+                    "strategy": args.strategy,
+                    "mode": args.mode,
+                    "world_size": world_size,
+                    "per_device_batch": args.per_device_batch,
+                    "seq_len": args.seq_len,
+                    "steps": args.steps,
+                    "warmup": args.warmup,
+                    "bf16": args.bf16,
+                    "fp16": args.fp16,
+                    "backend": args.backend,
+                    "lr": args.lr,
+                    "fsdp_sharding": args.fsdp_sharding,
+                    "train_dataset_len": len(lm_train),
+                    "val_dataset_len": len(lm_val),
+                },
             )
-        )
-    if args.mode in ("infer", "both"):
-        val_sampler.set_epoch(0)
-        out.update(
-            run_eval(
-                model,
-                device,
-                val_it,
-                steps=args.steps,
-                warmup=args.warmup,
-                amp_dtype=amp_dtype,
-            )
-        )
 
-    _barrier()
-    if _rank0():
-        print("[results]", flush=True)
-        for k in sorted(out):
-            print(f"  {k}: {out[k]:.6g}", flush=True)
+        if args.mode in ("train", "both"):
+            train_sampler.set_epoch(args.seed)
+            out.update(
+                run_train(
+                    model,
+                    optim,
+                    device,
+                    train_it,
+                    steps=args.steps,
+                    warmup=args.warmup,
+                    amp_dtype=amp_dtype,
+                    grad_clip=args.grad_clip,
+                )
+            )
+        if args.mode in ("infer", "both"):
+            val_sampler.set_epoch(0)
+            out.update(
+                run_eval(
+                    model,
+                    device,
+                    val_it,
+                    steps=args.steps,
+                    warmup=args.warmup,
+                    amp_dtype=amp_dtype,
+                )
+            )
+
+        _barrier()
+        if _rank0():
+            print("[results]", flush=True)
+            for k in sorted(out):
+                print(f"  {k}: {out[k]:.6g}", flush=True)
+
+            row: dict[str, Any] = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "strategy": args.strategy,
+                "model": args.model,
+                "mode": args.mode,
+                "world_size": world_size,
+                "per_device_batch": args.per_device_batch,
+                "seq_len": args.seq_len,
+                "steps": args.steps,
+                "warmup": args.warmup,
+                "bf16": args.bf16,
+                "fp16": args.fp16,
+                "backend": args.backend,
+                "lr": args.lr,
+                "fsdp_sharding": args.fsdp_sharding,
+                "train_dataset_len": len(lm_train),
+                "val_dataset_len": len(lm_val),
+            }
+            row.update({k: float(v) for k, v in out.items()})
+
+            if args.metrics_out:
+                path = os.path.abspath(args.metrics_out)
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as mf:
+                    mf.write(json.dumps(row, sort_keys=True) + "\n")
+                print(f"[metrics] appended -> {path}", flush=True)
+
+            if wandb_run is not None:
+                import wandb
+
+                wandb.log({k: float(v) for k, v in out.items()})
+    finally:
+        if _rank0() and wandb_run is not None:
+            import wandb
+
+            wandb.finish()
 
     if dist.is_initialized():
         dist.destroy_process_group()
