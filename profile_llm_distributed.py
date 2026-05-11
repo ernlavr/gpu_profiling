@@ -119,23 +119,65 @@ def _load_causal_lm(
     return model
 
 
+def _raw_row_cap_for_sequences(
+    max_lm_sequences: int,
+    raw_text_oversample: int,
+    full_raw_len: int,
+) -> int:
+    """How many raw Wikitext lines to load before tokenize (heuristic, speeds up prep)."""
+    need = max(1, max_lm_sequences * raw_text_oversample)
+    return min(full_raw_len, need)
+
+
 def _prepare_wikitext2(
     tokenizer: Any,
     seq_len: int,
     rank: int,
+    *,
+    max_train_sequences: int = 0,
+    max_val_sequences: int = 0,
+    raw_text_oversample: int = 32,
 ) -> tuple[Any, Any]:
-    """HF datasets: blocked causal LM chunks from Wikitext-2 raw."""
+    """HF datasets: blocked causal LM chunks from Wikitext-2 raw.
+
+    If ``max_train_sequences`` / ``max_val_sequences`` > 0, only the first
+    ``max_* × raw_text_oversample`` raw lines of that split are tokenized (approximate
+    text budget), then blocks are capped to the max sequence count.
+    """
     raw = load_dataset("wikitext", "wikitext-2-raw-v1")
+    train_raw = raw["train"]
+    val_raw = raw["validation"]
+    full_train_rows = len(train_raw)
+    full_val_rows = len(val_raw)
+
+    train_raw_rows_used = full_train_rows
+    val_raw_rows_used = full_val_rows
+    if max_train_sequences > 0:
+        train_raw_rows_used = _raw_row_cap_for_sequences(
+            max_train_sequences, raw_text_oversample, full_train_rows
+        )
+        train_raw = train_raw.select(range(train_raw_rows_used))
+    if max_val_sequences > 0:
+        val_raw_rows_used = _raw_row_cap_for_sequences(
+            max_val_sequences, raw_text_oversample, full_val_rows
+        )
+        val_raw = val_raw.select(range(val_raw_rows_used))
 
     def tok(batch: dict[str, list]) -> dict[str, Any]:
         o = tokenizer(batch["text"], add_special_tokens=False, padding=False, truncation=False)
         return {"input_ids": o["input_ids"], "attention_mask": o["attention_mask"]}
 
-    tokenized = raw.map(
+    tokenized_train = train_raw.map(
         tok,
         batched=True,
-        remove_columns=raw["train"].column_names,
-        desc="tokenize wikitext-2",
+        remove_columns=train_raw.column_names,
+        desc="tokenize wikitext-2 train",
+    )
+    tokenized_val = val_raw.map(
+        tok,
+        batched=True,
+        remove_columns=val_raw.column_names,
+        desc="tokenize wikitext-2 val",
     )
 
     block_size = seq_len
@@ -150,12 +192,12 @@ def _prepare_wikitext2(
         out_attn = [attn[i : i + block_size] for i in range(0, total, block_size)]
         return {"input_ids": out_ids, "attention_mask": out_attn}
 
-    lm_train = tokenized["train"].map(
+    lm_train = tokenized_train.map(
         group_texts,
         batched=True,
         desc="group train",
     )
-    lm_val = tokenized["validation"].map(
+    lm_val = tokenized_val.map(
         group_texts,
         batched=True,
         desc="group val",
@@ -164,8 +206,26 @@ def _prepare_wikitext2(
     lm_train = lm_train.filter(lambda x: len(x["input_ids"]) > 0)
     lm_val = lm_val.filter(lambda x: len(x["input_ids"]) > 0)
 
+    if max_train_sequences > 0 and len(lm_train) > max_train_sequences:
+        lm_train = lm_train.select(range(max_train_sequences))
+    if max_val_sequences > 0 and len(lm_val) > max_val_sequences:
+        lm_val = lm_val.select(range(max_val_sequences))
+
     if rank == 0 and len(lm_train) == 0:
         raise RuntimeError("Wikitext-2 produced zero training blocks; check tokenizer/seq_len.")
+
+    if rank == 0:
+        print(
+            f"[wikitext] train raw_lines={train_raw_rows_used}/{full_train_rows} -> "
+            f"{len(lm_train)} blocks (max_train_sequences={max_train_sequences or 'all'})",
+            flush=True,
+        )
+        print(
+            f"[wikitext] val   raw_lines={val_raw_rows_used}/{full_val_rows} -> "
+            f"{len(lm_val)} blocks (max_val_sequences={max_val_sequences or 'all'}, "
+            f"raw_text_oversample={raw_text_oversample})",
+            flush=True,
+        )
 
     columns = ["input_ids", "attention_mask"]
     lm_train.set_format(type="torch", columns=columns)
@@ -507,6 +567,9 @@ def _build_wandb_config(
         "dataloader_workers": args.dataloader_workers,
         "seed": args.seed,
         "data": "wikitext-2-raw-v1",
+        "max_train_sequences": args.max_train_sequences,
+        "max_val_sequences": args.max_val_sequences,
+        "raw_text_oversample": args.raw_text_oversample,
         "train_dataset_len": train_dataset_len,
         "val_dataset_len": val_dataset_len,
         "torch_version": torch.__version__,
@@ -536,6 +599,24 @@ def parse_args() -> argparse.Namespace:
         help="Upper bound for --auto-max-batch (per device)",
     )
     p.add_argument("--seq-len", type=int, default=512, help="Blocked context length for LM")
+    p.add_argument(
+        "--max-train-sequences",
+        type=int,
+        default=0,
+        help="Cap train LM blocks; 0 = full Wikitext train. Raw lines tokenized ≈ this × --raw-text-oversample.",
+    )
+    p.add_argument(
+        "--max-val-sequences",
+        type=int,
+        default=0,
+        help="Cap validation LM blocks; 0 = full Wikitext validation.",
+    )
+    p.add_argument(
+        "--raw-text-oversample",
+        type=int,
+        default=32,
+        help="Raw wiki lines to take ≈ max_sequences × this before tokenize (heuristic; raise if block cap is not reached).",
+    )
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--dataloader-workers", type=int, default=2)
@@ -601,7 +682,14 @@ def main() -> None:
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    lm_train, lm_val = _prepare_wikitext2(tokenizer, args.seq_len, rank)
+    lm_train, lm_val = _prepare_wikitext2(
+        tokenizer,
+        args.seq_len,
+        rank,
+        max_train_sequences=args.max_train_sequences,
+        max_val_sequences=args.max_val_sequences,
+        raw_text_oversample=args.raw_text_oversample,
+    )
 
     train_sampler = DistributedSampler(
         lm_train,
@@ -636,6 +724,8 @@ def main() -> None:
         print(
             f"[config] data=wikitext-2-raw-v1 model={args.model} strategy={args.strategy} mode={args.mode} "
             f"world_size={world_size} seq_len={args.seq_len} per_device_batch={args.per_device_batch} "
+            f"max_train_sequences={args.max_train_sequences or 'all'} max_val_sequences={args.max_val_sequences or 'all'} "
+            f"raw_text_oversample={args.raw_text_oversample} "
             f"steps={args.steps} warmup={args.warmup} bf16={args.bf16} fp16={args.fp16} "
             f"auto_max_batch={args.auto_max_batch}",
             flush=True,
@@ -850,6 +940,9 @@ def main() -> None:
                     "fp16": args.fp16,
                     "auto_max_batch": args.auto_max_batch,
                     "backend": args.backend,
+                    "max_train_sequences": args.max_train_sequences,
+                    "max_val_sequences": args.max_val_sequences,
+                    "raw_text_oversample": args.raw_text_oversample,
                 }
                 row.update({k: float(v) for k, v in results.items()})
                 plot_path = os.path.abspath(args.plot_jsonl)
