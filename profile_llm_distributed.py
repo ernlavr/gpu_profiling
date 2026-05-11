@@ -28,8 +28,10 @@ from __future__ import annotations
 import argparse
 import functools
 import itertools
+import json
 import os
 import time
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from typing import Any, Iterator
 
@@ -565,6 +567,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated W&B tags (e.g. nvidia,a100 or amd,mi300).",
     )
+    p.add_argument(
+        "--plot-jsonl",
+        type=str,
+        default="",
+        help="Append one JSON object per run (rank 0) for plotting, e.g. pandas.read_json(path, lines=True).",
+    )
     return p.parse_args()
 
 
@@ -826,6 +834,31 @@ def main() -> None:
             print("[results]", flush=True)
             for k in sorted(results):
                 print(f"  {k}: {results[k]:.6g}", flush=True)
+            if args.plot_jsonl:
+                row: dict[str, Any] = {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "strategy": args.strategy,
+                    "world_size": world_size,
+                    "model": args.model,
+                    "mode": args.mode,
+                    "seq_len": args.seq_len,
+                    "per_device_batch_train": train_bs,
+                    "per_device_batch_infer": infer_bs,
+                    "steps": args.steps,
+                    "warmup": args.warmup,
+                    "bf16": args.bf16,
+                    "fp16": args.fp16,
+                    "auto_max_batch": args.auto_max_batch,
+                    "backend": args.backend,
+                }
+                row.update({k: float(v) for k, v in results.items()})
+                plot_path = os.path.abspath(args.plot_jsonl)
+                parent = os.path.dirname(plot_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(plot_path, "a", encoding="utf-8") as pf:
+                    pf.write(json.dumps(row, sort_keys=True) + "\n")
+                print(f"[plot] appended row to {plot_path}", flush=True)
             print(
                 "[note] For max VRAM: raise seq_len, use --auto-max-batch (and --batch-search-cap), prefer --bf16. "
                 "Peak MiB is max across ranks. Avoid --gradient-checkpointing if you want highest activation memory.",
