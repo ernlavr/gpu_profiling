@@ -1,6 +1,4 @@
-# Pin torch to your platform wheel (CUDA vs ROCm) from pytorch.org — do not rely on this unpinned line alone.
+# Pin torch to your platform wheel (CUDA vs ROCm) from pytorch.org.
 torch>=2.2.0
 transformers>=4.38.0
-accelerate>=0.27.0
 datasets>=2.16.0
-wandb>=0.16.0
